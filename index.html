@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#2563eb">
+<title>社会ワーク 自動採点</title>
+<style>
+*{box-sizing:border-box}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Noto Sans JP",sans-serif;background:#f5f7fb;color:#172033}
+header{background:#2563eb;color:white;padding:16px 18px;position:sticky;top:0;z-index:10}
+h1{font-size:20px;margin:0 0 4px}.sub{font-size:12px;opacity:.9}
+main{max-width:900px;margin:auto;padding:14px}.tabs{display:flex;gap:6px;overflow:auto;margin-bottom:12px}
+button,.filelabel{border:0;border-radius:10px;padding:11px 14px;font-weight:700;background:#e8edf7;color:#24324a}
+button.primary,.active{background:#2563eb;color:white}.danger{background:#fee2e2;color:#991b1b}
+.card{background:white;border-radius:16px;padding:15px;margin-bottom:12px;box-shadow:0 2px 12px #0000000c}
+label{font-size:13px;font-weight:700;display:block;margin:8px 0 5px}input,textarea,select{width:100%;padding:11px;border:1px solid #d7deea;border-radius:9px;font-size:16px}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:9px}.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+#templateCanvas{width:100%;border:1px solid #ccd5e3;border-radius:10px;touch-action:none;background:#fff}
+.small{font-size:12px;color:#667085}.key{display:flex;align-items:center;justify-content:space-between;padding:10px;border:1px solid #e1e6ef;border-radius:10px;margin-top:7px}
+.badge{padding:4px 8px;border-radius:999px;background:#eef2ff;font-size:12px}.ok{color:#047857;background:#d1fae5}.ng{color:#b91c1c;background:#fee2e2}.review{color:#92400e;background:#fef3c7}
+.answerImg{max-width:100%;border-radius:8px;border:1px solid #ddd}.result{border:1px solid #e0e5ee;border-radius:12px;padding:12px;margin:9px 0}
+.hidden{display:none}.score{font-size:28px;font-weight:800}.progress{height:8px;background:#e7ebf2;border-radius:99px;overflow:hidden}.bar{height:100%;background:#2563eb;width:0}
+footer{font-size:11px;color:#7a8497;text-align:center;padding:20px}
+@media(max-width:600px){.row{grid-template-columns:1fr}main{padding:10px}}
+</style>
+</head>
+<body>
+<header><h1>社会ワーク 自動採点</h1><div class="sub">答案写真 → 手書きOCR → 登録解答と照合</div></header>
+<main>
+<div class="tabs">
+<button class="tab active" data-tab="setup">①問題登録</button>
+<button class="tab" data-tab="answer">②答案写真</button>
+<button class="tab" data-tab="grade">③自動採点</button>
+</div>
+
+<section id="setup" class="tabbody">
+<div class="card">
+<h2>問題テンプレート</h2>
+<p class="small">白紙のワーク写真を読み込み、各空欄を指で囲んで正解を登録します。赤字・黒字は同じ「文字」として扱います。</p>
+<input id="templateFile" type="file" accept="image/*">
+<div class="actions"><button id="clearBoxes" class="danger">空欄を全部削除</button></div>
+<canvas id="templateCanvas"></canvas>
+<div id="boxForm" class="hidden">
+<div class="row">
+<div><label>問題番号</label><input id="qid" placeholder="P1-01"></div>
+<div><label>正解</label><input id="correct" placeholder="例：鎌倉幕府"></div>
+</div>
+<label>別解（カンマ区切り・任意）</label>
+<input id="aliases" placeholder="例：鎌倉幕府成立">
+<div class="actions"><button id="saveBox" class="primary">この空欄を登録</button><button id="cancelBox">キャンセル</button></div>
+</div>
+<div id="keys"></div>
+<div class="actions"><button id="exportTemplate">テンプレートを書き出す</button><button id="importBtn">テンプレートを読み込む</button><input id="importFile" class="hidden" type="file" accept=".json"></div>
+</div>
+</section>
+
+<section id="answer" class="tabbody hidden">
+<div class="card">
+<h2>答案写真</h2>
+<p class="small">同じ順番のページを複数選択できます。iPadのカメラで撮影した写真にも対応します。</p>
+<input id="answerFiles" type="file" accept="image/*" multiple>
+<div id="previews"></div>
+</div>
+</section>
+
+<section id="grade" class="tabbody hidden">
+<div class="card">
+<h2>自動採点</h2>
+<p class="small">空欄ごとに画像を切り出し、日本語OCRを実行します。認識が不確かなものは「要確認」にします。</p>
+<button id="startGrade" class="primary">自動採点を開始</button>
+<div style="margin-top:12px" class="progress"><div id="bar" class="bar"></div></div>
+<div id="progressText" class="small" style="margin-top:6px"></div>
+</div>
+<div id="summary" class="card hidden"></div>
+<div id="results"></div>
+</section>
+</main>
+<footer>※ 手書き日本語OCRは字形・写真の傾き・画質によって誤認識することがあります。要確認は必ず確認してください。</footer>
+
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<script>
+const $=id=>document.getElementById(id);
+let templateImg=null, boxes=[], selectedBox=null, drawing=false, sx=0,sy=0, currentImage=null, answerImages=[];
+const canvas=$("templateCanvas"), ctx=canvas.getContext("2d");
+
+function saveLocal(){localStorage.setItem("socialGraderTemplate",JSON.stringify({boxes}));}
+function loadLocal(){try{let x=JSON.parse(localStorage.getItem("socialGraderTemplate"));if(x?.boxes)boxes=x.boxes}catch(e){} renderKeys();}
+function normalize(s){return (s||"").normalize("NFKC").replace(/[\\s\\n\\r　、。,.，．・:：;；!?！？「」『』（）()［］\[\]{}]/g,"").toLowerCase();}
+function accepted(b){return [b.correct,...(b.aliases||[])].map(normalize).filter(Boolean)}
+function renderKeys(){
+  $("keys").innerHTML=boxes.length?'<h3>登録済みの空欄</h3>'+boxes.map((b,i)=>`<div class="key"><span><b>${b.qid}</b>　正解：${escapeHtml(b.correct)}</span><button data-del="${i}" class="danger">削除</button></div>`).join(""):'<p class="small">まだ空欄が登録されていません。</p>';
+  document.querySelectorAll("[data-del]").forEach(b=>b.onclick=()=>{boxes.splice(+b.dataset.del,1);saveLocal();render();});
+}
+function escapeHtml(s){return String(s).replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m]));}
+function render(){
+ if(!templateImg)return;
+ const maxW=Math.min(1000,window.innerWidth-30), scale=maxW/templateImg.width;
+ canvas.width=Math.round(templateImg.width*scale);canvas.height=Math.round(templateImg.height*scale);
+ ctx.drawImage(templateImg,0,0,canvas.width,canvas.height);
+ boxes.forEach((b,i)=>{ctx.strokeStyle="#2563eb";ctx.lineWidth=3;ctx.strokeRect(b.x*scale,b.y*scale,b.w*scale,b.h*scale);ctx.fillStyle="#2563eb";ctx.fillRect(b.x*scale,b.y*scale,Math.max(28,ctx.measureText(b.qid).width+10),22);ctx.fillStyle="#fff";ctx.font="bold 13px sans-serif";ctx.fillText(b.qid,b.x*scale+5,b.y*scale+16);});
+}
+$("templateFile").onchange=e=>{let f=e.target.files[0];if(!f)return;let im=new Image();im.onload=()=>{templateImg=im;render()};im.src=URL.createObjectURL(f);}
+canvas.addEventListener("pointerdown",e=>{if(!templateImg)return;drawing=true;canvas.setPointerCapture(e.pointerId);let r=canvas.getBoundingClientRect();sx=e.clientX-r.left;sy=e.clientY-r.top;});
+canvas.addEventListener("pointerup",e=>{if(!drawing)return;drawing=false;let r=canvas.getBoundingClientRect(),ex=e.clientX-r.left,ey=e.clientY-r.top;let scale=canvas.width/templateImg.width,x=Math.min(sx,ex)/scale,y=Math.min(sy,ey)/scale,w=Math.abs(ex-sx)/scale,h=Math.abs(ey-sy)/scale;if(w<8||h<8)return;
+selectedBox={x,y,w,h};$("boxForm").classList.remove("hidden");$("qid").value=`P1-${String(boxes.length+1).padStart(2,"0")}`;$("correct").value="";$("aliases").value="";
+});
+$("saveBox").onclick=()=>{if(!selectedBox)return;let qid=$("qid").value.trim(),correct=$("correct").value.trim();if(!qid||!correct){alert("問題番号と正解を入力してください");return;}boxes.push({...selectedBox,qid,correct,aliases:$("aliases").value.split(",").map(x=>x.trim()).filter(Boolean)});selectedBox=null;$("boxForm").classList.add("hidden");saveLocal();render();}
+$("cancelBox").onclick=()=>{$("boxForm").classList.add("hidden");selectedBox=null}
+$("clearBoxes").onclick=()=>{if(confirm("登録した空欄を全部削除しますか？")){boxes=[];saveLocal();render();}}
+$("exportTemplate").onclick=()=>{let blob=new Blob([JSON.stringify({boxes},null,2)],{type:"application/json"}),a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="社会ワーク_採点テンプレート.json";a.click();}
+$("importBtn").onclick=()=>$("importFile").click();
+$("importFile").onchange=e=>{let f=e.target.files[0];if(!f)return;let r=new FileReader();r.onload=()=>{try{boxes=JSON.parse(r.result).boxes||[];saveLocal();render();renderKeys()}catch{alert("テンプレートを読み込めませんでした")}};r.readAsText(f)}
+$("answerFiles").onchange=e=>{answerImages=[...e.target.files];$("previews").innerHTML=answerImages.map((f,i)=>`<div class="card"><b>ページ ${i+1}</b><br><img class="answerImg" src="${URL.createObjectURL(f)}"></div>`).join("");}
+function cropImage(file,b){
+ return new Promise(resolve=>{let im=new Image();im.onload=()=>{let scale=canvas.width/templateImg.width;let x=b.x*scale,y=b.y*scale,w=b.w*scale,h=b.h*scale;
+ // Map template coordinates to answer image using proportional scaling. For best results, photograph pages straight and fill the frame.
+ let c=document.createElement("canvas");let ratio=im.width/templateImg.width;c.width=Math.max(100,Math.round(w*ratio*1.8));c.height=Math.max(60,Math.round(h*ratio*1.8));
+ let cc=c.getContext("2d");cc.fillStyle="white";cc.fillRect(0,0,c.width,c.height);cc.drawImage(im,(x/scale)*ratio-(c.width-w*ratio)/2,(y/scale)*ratio-(c.height-h*ratio)/2,w*ratio,h*ratio,0,0,c.width,c.height);resolve(c.toDataURL("image/jpeg",.92));};im.src=URL.createObjectURL(file);});
+}
+async function recognize(data){
+ const worker=await Tesseract.createWorker("jpn",1,{logger:m=>{if(m.status==="recognizing text") $("progressText").textContent="OCR中… "+Math.round((m.progress||0)*100)+"%";}});
+ let r=await worker.recognize(data);await worker.terminate();return {text:r.data.text||"",confidence:r.data.confidence||0};
+}
+$("startGrade").onclick=async()=>{
+ if(!templateImg||!boxes.length||!answerImages.length){alert("①でテンプレートと空欄を登録し、②で答案写真を選択してください。");return;}
+ $("results").innerHTML="";$("summary").classList.add("hidden");let total=boxes.length*answerImages.length,done=0,ok=0,ng=0,review=0;
+ for(let p=0;p<answerImages.length;p++){
+   for(const b of boxes){
+     const img=await cropImage(answerImages[p],b);
+     let rec=await recognize(img), norm=normalize(rec.text), valid=accepted(b);
+     let isMatch=valid.some(a=>a===norm);
+     let status=rec.confidence>=72?(isMatch?"ok":"ng"):"review";
+     if(status==="ok")ok++; else if(status==="ng")ng++; else review++;
+     $("results").insertAdjacentHTML("beforeend",`<div class="result"><div><b>ページ${p+1}・${escapeHtml(b.qid)}</b> <span class="badge ${status}">${status==="ok"?"○ 正解":status==="ng"?"× 不正解":"要確認"}</span></div><p>認識：<b>${escapeHtml(rec.text.trim()||"(認識できません)")}</b></p><p class="small">正解：${escapeHtml(b.correct)}　OCR信頼度：${Math.round(rec.confidence)}</p><img class="answerImg" src="${img}"></div>`);
+     done++;$("bar").style.width=Math.round(done/total*100)+"%";$("progressText").textContent=`${done}/${total} 問を処理しました`;
+   }
+ }
+ $("summary").classList.remove("hidden");$("summary").innerHTML=`<div class="score">${ok}/${total} 正解</div><p>○ ${ok}　× ${ng}　要確認 ${review}</p><p class="small">要確認はOCR信頼度が低かった問題です。自動で×にはしていません。</p>`;
+};
+document.querySelectorAll(".tab").forEach(b=>b.onclick=()=>{document.querySelectorAll(".tab").forEach(x=>x.classList.remove("active"));b.classList.add("active");document.querySelectorAll(".tabbody").forEach(x=>x.classList.add("hidden"));$(b.dataset.tab).classList.remove("hidden");});
+window.onresize=()=>render();loadLocal();renderKeys();
+</script>
+</body>
+</html>
