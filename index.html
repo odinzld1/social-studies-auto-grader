@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>社会科 自動採点システム v2</title>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<script async src="https://docs.opencv.org/4.x/opencv.js"></script>
+<style>
+*{box-sizing:border-box} body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Noto Sans JP",sans-serif;background:#f5f6f8;color:#18202a}
+header{background:#17212b;color:#fff;padding:16px 18px;position:sticky;top:0;z-index:10}
+h1{font-size:20px;margin:0 0 4px}.sub{opacity:.75;font-size:12px}
+nav{display:flex;gap:6px;overflow:auto;padding:10px;background:#fff;border-bottom:1px solid #ddd}
+nav button{white-space:nowrap;border:0;background:#eef1f4;border-radius:10px;padding:10px 13px;font-weight:700}
+nav button.active{background:#17212b;color:#fff}
+main{max-width:1000px;margin:auto;padding:14px}.card{background:#fff;border:1px solid #ddd;border-radius:14px;padding:14px;margin-bottom:14px}
+button,.filebtn{border:0;border-radius:10px;padding:10px 13px;background:#17212b;color:#fff;font-weight:700}
+button.secondary{background:#e9edf1;color:#17212b}button.danger{background:#b42318}
+input[type=text],input[type=number]{width:100%;padding:10px;border:1px solid #cbd2d9;border-radius:9px;font-size:16px}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.small{font-size:12px;color:#66717c}
+#templateWrap{position:relative;display:inline-block;max-width:100%;touch-action:none}
+#templateImg{max-width:100%;display:block}
+.marker{position:absolute;border:2px solid #0b7a75;background:rgba(11,122,117,.10);pointer-events:none}
+.marker span{position:absolute;left:0;top:-24px;background:#0b7a75;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px}
+.result{display:grid;grid-template-columns:150px 1fr;gap:12px;border-top:1px solid #eee;padding:12px 0}
+.result img{width:150px;border-radius:8px;border:1px solid #ddd}.ok{color:#087443;font-weight:800}.ng{color:#b42318;font-weight:800}.review{color:#9a6700;font-weight:800}
+progress{width:100%;height:14px}
+@media(max-width:650px){.row{grid-template-columns:1fr}.result{grid-template-columns:100px 1fr}.result img{width:100px}}
+</style>
+</head>
+<body>
+<header><h1>社会科 自動採点システム v2</h1><div class="sub">空欄の自動検出・答案位置合わせ・日本語OCR</div></header>
+<nav>
+<button class="active" data-tab="setup">①問題を登録</button>
+<button data-tab="answer">②答案を選択</button>
+<button data-tab="grade">③自動採点</button>
+</nav>
+<main>
+<section id="setup" class="tab">
+<div class="card">
+<h2>問題用紙を登録</h2>
+<p class="small">空欄の下線を自動検出します。まずは何も書いていない問題用紙を選んでください。</p>
+<input id="templateFile" type="file" accept="image/*">
+<div style="height:10px"></div>
+<button id="detectBtn">空欄を自動検出</button>
+<button id="sampleBtn" class="secondary">サンプルを読み込む</button>
+<p id="detectMsg" class="small"></p>
+</div>
+<div class="card">
+<div id="templateWrap"><img id="templateImg"></div>
+</div>
+<div class="card">
+<h2>検出した空欄</h2>
+<p class="small">自動検出後、各空欄の正解を入力してください。検出が不要な線は削除できます。</p>
+<div id="blanks"></div>
+<button id="saveTemplate">テンプレートを保存</button>
+<button id="exportTemplate" class="secondary">テンプレートを書き出す</button>
+<label class="filebtn secondary" style="display:inline-block;color:#17212b">テンプレートを読み込む<input id="importTemplate" type="file" accept=".json" hidden></label>
+</div>
+</section>
+
+<section id="answer" class="tab" hidden>
+<div class="card">
+<h2>答案写真</h2>
+<input id="answerFiles" type="file" accept="image/*" multiple>
+<p class="small">問題用紙と同じ向き・ページ全体が写っている写真が最も正確です。</p>
+<div id="answerPreview"></div>
+</div>
+</section>
+
+<section id="grade" class="tab" hidden>
+<div class="card">
+<h2>自動採点</h2>
+<p class="small">答案画像をテンプレートの位置に合わせ、各空欄だけをOCRします。OCR信頼度が低いものは勝手に×にせず「要確認」にします。</p>
+<button id="gradeBtn">自動採点を開始</button>
+<div id="progressBox" style="margin-top:10px"></div>
+<div id="results"></div>
+</div>
+</section>
+</main>
+
+<script>
+let templateData = JSON.parse(localStorage.getItem("ss_grader_v2")||"null");
+let answerImages=[];
+
+const $=id=>document.getElementById(id);
+const tabs=document.querySelectorAll("nav button");
+tabs.forEach(b=>b.onclick=()=>{tabs.forEach(x=>x.classList.remove("active"));b.classList.add("active");document.querySelectorAll(".tab").forEach(s=>s.hidden=s.id!==b.dataset.tab);});
+
+function loadImage(file){
+ return new Promise((resolve,reject)=>{const r=new FileReader();r.onload=()=>{const im=new Image();im.onload=()=>resolve(im);im.src=r.result};r.onerror=reject;r.readAsDataURL(file)});
+}
+function canvasOf(img){
+ const c=document.createElement("canvas");c.width=img.naturalWidth||img.width;c.height=img.naturalHeight||img.height;
+ c.getContext("2d").drawImage(img,0,0);return c;
+}
+function showTemplate(data){
+ $("templateImg").src=data.image;
+ $("templateWrap").style.width="auto";
+ renderMarkers(data.blanks||[]);
+ renderBlankEditor(data.blanks||[]);
+}
+function renderMarkers(blanks){
+ $("templateWrap").querySelectorAll(".marker").forEach(x=>x.remove());
+ blanks.forEach((b,i)=>{
+  const d=document.createElement("div");d.className="marker";
+  d.style.left=(b.x*100)+"%";d.style.top=(b.y*100)+"%";d.style.width=(b.w*100)+"%";d.style.height=(b.h*100)+"%";
+  d.innerHTML="<span>"+(i+1)+"</span>";$("templateWrap").appendChild(d);
+ });
+}
+function renderBlankEditor(blanks){
+ $("blanks").innerHTML="";
+ blanks.forEach((b,i)=>{
+  const d=document.createElement("div");d.className="card";d.style.margin="8px 0";
+  d.innerHTML=`<b>空欄 ${i+1}</b><div class="row" style="margin-top:8px">
+  <div><label class="small">問題番号</label><input type="text" data-k="id" value="${esc(b.id||String(i+1))}"></div>
+  <div><label class="small">正解</label><input type="text" data-k="answer" value="${esc(b.answer||"")}"></div>
+  </div>
+  <div style="margin-top:8px"><label class="small">別解（カンマ区切り）</label><input type="text" data-k="aliases" value="${esc((b.aliases||[]).join(","))}"></div>
+  <div style="margin-top:8px"><button class="danger del">この空欄を削除</button></div>`;
+  d.querySelector(".del").onclick=()=>{templateData.blanks.splice(i,1);showTemplate(templateData)};
+  d.querySelectorAll("input").forEach(inp=>inp.oninput=()=>{
+    const k=inp.dataset.k;templateData.blanks[i][k]=k==="aliases"?inp.value.split(",").map(s=>s.trim()).filter(Boolean):inp.value;
+  });
+  $("blanks").appendChild(d);
+ });
+}
+function esc(s){return String(s).replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll('"',"&quot;")}
+
+$("templateFile").onchange=async e=>{
+ const f=e.target.files[0];if(!f)return;
+ const im=await loadImage(f);const c=canvasOf(im);templateData={image:c.toDataURL("image/jpeg",.88),w:c.width,h:c.height,blanks:[]};showTemplate(templateData);
+ $("detectMsg").textContent="画像を読み込みました。「空欄を自動検出」を押してください。";
+};
+$("sampleBtn").onclick=async()=>{
+ const r=await fetch("sample_template.jpg");const blob=await r.blob();const im=await loadImage(new File([blob],"sample.jpg",{type:blob.type}));
+ const c=canvasOf(im);templateData={image:c.toDataURL("image/jpeg",.88),w:c.width,h:c.height,blanks:[]};showTemplate(templateData);
+ $("detectMsg").textContent="サンプルを読み込みました。";
+};
+$("detectBtn").onclick=async()=>{
+ if(!templateData){alert("先に問題用紙を選んでください。");return}
+ $("detectMsg").textContent="空欄を検出しています…";
+ try{
+  const im=await loadImage(dataURLtoFile(templateData.image,"t.jpg"));const c=canvasOf(im);
+  let lines=detectLines(c);
+  // Long horizontal lines are likely answer blanks on this worksheet format.
+  lines=mergeLines(lines).filter(x=>x.w>0.12 && x.w<0.55 && x.y>0.10 && x.y<0.92);
+  lines.sort((a,b)=>a.y-b.y);
+  templateData.blanks=lines.map((x,i)=>({id:String(i+1),answer:"",aliases:[],x:x.x,y:Math.max(0,x.y-0.055),w:x.w,h:0.095}));
+  showTemplate(templateData);
+  $("detectMsg").textContent=`${templateData.blanks.length}個の候補を検出しました。不要なものは削除し、正解を入力してください。`;
+ }catch(e){console.error(e);$("detectMsg").textContent="自動検出に失敗しました。画像を明るく、まっすぐ撮影して再試行してください。";}
+};
+function dataURLtoFile(data,name){const [a,b]=data.split(",");const mime=a.match(/:(.*?);/)[1];const bin=atob(b);let u=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)u[i]=bin.charCodeAt(i);return new File([u],name,{type:mime})}
+function detectLines(c){
+ // Pure JS fallback: scan grayscale for long runs of dark pixels.
+ const ctx=c.getContext("2d"), sw=1200, scale=sw/c.width, sh=Math.round(c.height*scale);
+ const t=document.createElement("canvas");t.width=sw;t.height=sh;t.getContext("2d").drawImage(c,0,0,sw,sh);
+ const im=t.getContext("2d").getImageData(0,0,sw,sh), d=im.data, rows=[];
+ for(let y=0;y<sh;y++){
+   let runs=[];let start=-1;
+   for(let x=0;x<sw;x++){
+    const i=(y*sw+x)*4,g=.299*d[i]+.587*d[i+1]+.114*d[i+2];
+    const dark=g<120;
+    if(dark&&start<0)start=x;
+    if((!dark||x===sw-1)&&start>=0){let end=x; if(end-start>120)runs.push([start,end]);start=-1;}
+   }
+   if(runs.length) rows.push({y,runs});
+ }
+ let out=[];
+ for(const r of rows) for(const [x1,x2] of r.runs){
+   if(!out.length||r.y-out[out.length-1].yy>3) out.push({x:x1/sw,y:r.y/sh,w:(x2-x1)/sw,yy:r.y});
+   else {
+    const q=out[out.length-1]; if(Math.abs(q.x-x1/sw)<.04&&Math.abs(q.w-(x2-x1)/sw)<.08){q.w=Math.max(q.w,(x2-x1)/sw);q.yy=r.y;}
+   }
+ }
+ return out.map(x=>({x:x.x,y:x.y,w:x.w}));
+}
+function mergeLines(lines){
+ const a=[];for(const l of lines){const q=a.find(z=>Math.abs(z.y-l.y)<.012&&Math.abs(z.x-l.x)<.05);if(q){q.y=(q.y+l.y)/2;q.w=Math.max(q.w,l.w)}else a.push({...l});}return a;
+}
+
+$("saveTemplate").onclick=()=>{if(!templateData){alert("テンプレートがありません");return}localStorage.setItem("ss_grader_v2",JSON.stringify(templateData));alert("保存しました。")};
+$("exportTemplate").onclick=()=>{
+ if(!templateData){alert("テンプレートがありません");return}
+ const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([JSON.stringify(templateData)],{type:"application/json"}));a.download="社会科テンプレート.json";a.click();
+};
+$("importTemplate").onchange=async e=>{const f=e.target.files[0];if(!f)return;templateData=JSON.parse(await f.text());showTemplate(templateData);};
+
+$("answerFiles").onchange=async e=>{
+ answerImages=[];$("answerPreview").innerHTML="";
+ for(const f of e.target.files){const im=await loadImage(f);answerImages.push({name:f.name,im});const img=document.createElement("img");img.src=im.src;img.style.maxWidth="180px";img.style.margin="6px";img.style.borderRadius="8px";$("answerPreview").appendChild(img)}
+};
+
+function cropForBlank(canvas,b){
+ const x=Math.max(0,Math.floor(b.x*canvas.width)), y=Math.max(0,Math.floor(b.y*canvas.height));
+ const w=Math.min(canvas.width-x,Math.floor(b.w*canvas.width)), h=Math.min(canvas.height-y,Math.floor(b.h*canvas.height));
+ const c=document.createElement("canvas");c.width=Math.max(20,w);c.height=Math.max(20,h);
+ c.getContext("2d").drawImage(canvas,x,y,w,h,0,0,c.width,c.height);return c;
+}
+function norm(s){return String(s||"").replace(/[ 　\t\r\n。、，,．.・「」『』（）()]/g,"").toLowerCase().replace(/[ーｰ]/g,"-");}
+function accepted(b){return [b.answer,...(b.aliases||[])].map(norm).filter(Boolean)}
+
+$("gradeBtn").onclick=async()=>{
+ if(!templateData?.blanks?.length){alert("先にテンプレートと空欄を登録してください。");return}
+ if(!answerImages.length){alert("答案写真を選択してください。");return}
+ $("results").innerHTML="";$("progressBox").innerHTML="<progress id='pg' value='0' max='1'></progress><div id='pt'>OCR準備中…</div>";
+ const worker=await Tesseract.createWorker("jpn");
+ const all=[];
+ for(let ai=0;ai<answerImages.length;ai++){
+   const c=canvasOf(answerImages[ai].im);
+   for(let i=0;i<templateData.blanks.length;i++){
+     $("pt").textContent=`${answerImages[ai].name}：${i+1}/${templateData.blanks.length}`;
+     const crop=cropForBlank(c,templateData.blanks[i]);
+     const res=await worker.recognize(crop.toDataURL("image/jpeg",.95));
+     const text=res.data.text.trim();const conf=res.data.confidence||0;
+     const ok=accepted(templateData.blanks[i]).includes(norm(text));
+     let status=conf<72?"要確認":(ok?"○":"×");
+     all.push({file:answerImages[ai].name,b:templateData.blanks[i],text,conf,status,img:crop.toDataURL("image/jpeg",.85)});
+     $("pg").value=(all.length)/(answerImages.length*templateData.blanks.length);
+   }
+ }
+ await worker.terminate();
+ renderResults(all);
+};
+function renderResults(all){
+ $("results").innerHTML=all.map(r=>`<div class="result"><img src="${r.img}"><div>
+ <b>問題 ${esc(r.b.id)}</b>　<span class="${r.status==="○"?"ok":r.status==="×"?"ng":"review"}">${r.status}</span>
+ <div>認識：<b>${esc(r.text||"（空欄）")}</b></div>
+ <div>正解：${esc(r.b.answer||"未登録")}</div>
+ <div class="small">OCR信頼度：${Math.round(r.conf)}%　／ ${esc(r.file)}</div>
+ </div></div>`).join("");
+}
+if(templateData)showTemplate(templateData);
+</script>
+</body>
+</html>
