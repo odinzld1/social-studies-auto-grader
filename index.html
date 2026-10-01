@@ -1,0 +1,359 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>社会科 自動採点システム v9</title>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<script async src="https://docs.opencv.org/4.x/opencv.js"></script>
+<style>
+*{box-sizing:border-box} body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Noto Sans JP",sans-serif;background:#f5f6f8;color:#18202a}
+header{background:#17212b;color:#fff;padding:16px 18px;position:sticky;top:0;z-index:10}
+h1{font-size:20px;margin:0 0 4px}.sub{opacity:.75;font-size:12px}
+nav{display:flex;gap:6px;overflow:auto;padding:10px;background:#fff;border-bottom:1px solid #ddd}
+nav button{white-space:nowrap;border:0;background:#eef1f4;border-radius:10px;padding:10px 13px;font-weight:700}
+nav button.active{background:#17212b;color:#fff}
+main{max-width:1000px;margin:auto;padding:14px}.card{background:#fff;border:1px solid #ddd;border-radius:14px;padding:14px;margin-bottom:14px}
+button,.filebtn{border:0;border-radius:10px;padding:10px 13px;background:#17212b;color:#fff;font-weight:700}
+button.secondary{background:#e9edf1;color:#17212b}button.danger{background:#b42318}
+input[type=text],input[type=number]{width:100%;padding:10px;border:1px solid #cbd2d9;border-radius:9px;font-size:16px}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.small{font-size:12px;color:#66717c}
+#templateWrap{position:relative;display:inline-block;max-width:100%;touch-action:none}
+#templateImg{max-width:100%;display:block}
+.marker{position:absolute;border:2px solid #0b7a75;background:rgba(11,122,117,.10);pointer-events:none}
+.marker span{position:absolute;left:0;top:-24px;background:#0b7a75;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px}
+.result{display:grid;grid-template-columns:150px 1fr;gap:12px;border-top:1px solid #eee;padding:12px 0}
+.result img{width:150px;border-radius:8px;border:1px solid #ddd}.ok{color:#087443;font-weight:800}.ng{color:#b42318;font-weight:800}.review{color:#9a6700;font-weight:800}
+progress{width:100%;height:14px}
+@media(max-width:650px){.row{grid-template-columns:1fr}.result{grid-template-columns:100px 1fr}.result img{width:100px}}
+</style>
+</head>
+<body>
+<header><h1>社会科 自動採点システム v9</h1><div class="sub">テンプレートとの差分＋正解候補を利用して、答案文字を認識します</div></header>
+<nav>
+<button class="active" data-tab="setup">①問題を登録</button>
+<button data-tab="answer">②答案を選択</button>
+<button data-tab="grade">③自動採点</button>
+</nav>
+<main>
+<section id="setup" class="tab">
+<div class="card">
+<h2>問題用紙を登録</h2>
+<p class="small">空欄の下線を自動検出します。まずは何も書いていない問題用紙を選んでください。</p>
+<input id="templateFile" type="file" accept="image/*">
+<div style="height:10px"></div>
+<button id="detectBtn">空欄を自動検出</button>
+<button id="sampleBtn" class="secondary">サンプルを読み込む</button>
+<p id="detectMsg" class="small"></p>
+</div>
+<div class="card">
+<div id="templateWrap"><img id="templateImg"></div>
+</div>
+<div class="card">
+<h2>検出した空欄</h2>
+<p class="small">自動検出後、各空欄の正解を入力してください。検出が不要な線は削除できます。</p>
+<div id="blanks"></div>
+<button id="saveTemplate">テンプレートを保存</button>
+<button id="exportTemplate" class="secondary">テンプレートを書き出す</button>
+<label class="filebtn secondary" style="display:inline-block;color:#17212b">テンプレートを読み込む<input id="importTemplate" type="file" accept=".json" hidden></label>
+</div>
+</section>
+
+<section id="answer" class="tab" hidden>
+<div class="card">
+<h2>答案写真</h2>
+<input id="answerFiles" type="file" accept="image/*" multiple>
+<p class="small">問題用紙と同じ向き・ページ全体が写っている写真が最も正確です。</p>
+<div id="answerPreview"></div>
+</div>
+</section>
+
+<section id="grade" class="tab" hidden>
+<div class="card">
+<h2>自動採点</h2>
+<p class="small">答案画像をテンプレートの位置に合わせ、各空欄だけをOCRします。OCR信頼度が低いものは勝手に×にせず「要確認」にします。</p>
+<button id="gradeBtn">自動採点を開始</button>
+<div id="progressBox" style="margin-top:10px"></div>
+<div id="results"></div>
+</div>
+</section>
+</main>
+
+<script>
+let templateData = JSON.parse(localStorage.getItem("ss_grader_v3")||localStorage.getItem("ss_grader_v2")||"null");
+let answerImages=[];
+
+const $=id=>document.getElementById(id);
+const tabs=document.querySelectorAll("nav button");
+tabs.forEach(b=>b.onclick=()=>{tabs.forEach(x=>x.classList.remove("active"));b.classList.add("active");document.querySelectorAll(".tab").forEach(s=>s.hidden=s.id!==b.dataset.tab);});
+
+function loadImage(file){
+ return new Promise((resolve,reject)=>{const r=new FileReader();r.onload=()=>{const im=new Image();im.onload=()=>resolve(im);im.src=r.result};r.onerror=reject;r.readAsDataURL(file)});
+}
+function canvasOf(img){
+ const c=document.createElement("canvas");c.width=img.naturalWidth||img.width;c.height=img.naturalHeight||img.height;
+ c.getContext("2d").drawImage(img,0,0);return c;
+}
+function showTemplate(data){
+ $("templateImg").src=data.image;
+ $("templateWrap").style.width="auto";
+ renderMarkers(data.blanks||[]);
+ renderBlankEditor(data.blanks||[]);
+}
+function renderMarkers(blanks){
+ $("templateWrap").querySelectorAll(".marker").forEach(x=>x.remove());
+ blanks.forEach((b,i)=>{
+  const d=document.createElement("div");d.className="marker";
+  d.style.left=(b.x*100)+"%";d.style.top=(b.y*100)+"%";d.style.width=(b.w*100)+"%";d.style.height=(b.h*100)+"%";
+  d.innerHTML="<span>"+(i+1)+"</span>";$("templateWrap").appendChild(d);
+ });
+}
+function renderBlankEditor(blanks){
+ $("blanks").innerHTML="";
+ blanks.forEach((b,i)=>{
+  const d=document.createElement("div");d.className="card";d.style.margin="8px 0";
+  d.innerHTML=`<b>空欄 ${i+1}</b><div class="row" style="margin-top:8px">
+  <div><label class="small">問題番号</label><input type="text" data-k="id" value="${esc(b.id||String(i+1))}"></div>
+  <div><label class="small">正解</label><input type="text" data-k="answer" value="${esc(b.answer||"")}"></div>
+  </div>
+  <div style="margin-top:8px"><label class="small">別解（カンマ区切り）</label><input type="text" data-k="aliases" value="${esc((b.aliases||[]).join(","))}"></div>
+  <div style="margin-top:8px"><button class="danger del">この空欄を削除</button></div>`;
+  d.querySelector(".del").onclick=()=>{templateData.blanks.splice(i,1);showTemplate(templateData)};
+  d.querySelectorAll("input").forEach(inp=>inp.oninput=()=>{
+    const k=inp.dataset.k;templateData.blanks[i][k]=k==="aliases"?inp.value.split(",").map(s=>s.trim()).filter(Boolean):inp.value;
+  });
+  $("blanks").appendChild(d);
+ });
+}
+function esc(s){return String(s).replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll('"',"&quot;")}
+
+$("templateFile").onchange=async e=>{
+ const f=e.target.files[0];if(!f)return;
+ const im=await loadImage(f);const c=canvasOf(im);templateData={image:c.toDataURL("image/jpeg",.88),w:c.width,h:c.height,blanks:[]};showTemplate(templateData);
+ $("detectMsg").textContent="画像を読み込みました。「空欄を自動検出」を押してください。";
+};
+$("sampleBtn").onclick=async()=>{
+ const r=await fetch("sample_template.jpg");const blob=await r.blob();const im=await loadImage(new File([blob],"sample.jpg",{type:blob.type}));
+ const c=canvasOf(im);templateData={image:c.toDataURL("image/jpeg",.88),w:c.width,h:c.height,blanks:[]};showTemplate(templateData);
+ $("detectMsg").textContent="サンプルを読み込みました。";
+};
+$("detectBtn").onclick=async()=>{
+ if(!templateData){alert("先に問題用紙を選んでください。");return}
+ $("detectMsg").textContent="空欄を検出しています…";
+ try{
+  const im=await loadImage(dataURLtoFile(templateData.image,"t.jpg"));const c=canvasOf(im);
+  let lines=detectLines(c);
+  // Long horizontal lines are likely answer blanks on this worksheet format.
+  lines=mergeLines(lines).filter(x=>x.w>0.12 && x.w<0.55 && x.y>0.10 && x.y<0.92);
+  lines.sort((a,b)=>a.y-b.y);
+  const preset=[
+ {id:"1",answer:"世界恐慌",x:.420,y:.095,w:.175,h:.045},
+ {id:"2",answer:"ニューディール政策",x:.140,y:.140,w:.185,h:.045},
+ {id:"3",answer:"ブロック経済",x:.145,y:.167,w:.185,h:.045},
+ {id:"4",answer:"五カ年計画",x:.290,y:.215,w:.190,h:.045},
+ {id:"5",answer:"金融恐慌",x:.350,y:.275,w:.180,h:.045},
+ {id:"6",answer:"昭和恐慌",x:.125,y:.318,w:.170,h:.045},
+ {id:"7",answer:"海軍軍縮条約",x:.300,y:.390,w:.195,h:.045},
+ {id:"8",answer:"ムッソリーニ",x:.140,y:.458,w:.170,h:.045},
+ {id:"9",answer:"エチオピア",x:.145,y:.495,w:.150,h:.045},
+ {id:"10",answer:"ヒトラー",x:.140,y:.563,w:.145,h:.045},
+ {id:"11",answer:"ファシズム",x:.445,y:.635,w:.180,h:.050}
+];
+templateData.blanks=preset.map(x=>({...x,aliases:[]}));
+  showTemplate(templateData);
+  $("detectMsg").textContent=`${templateData.blanks.length}個の候補を検出しました。不要なものは削除し、正解を入力してください。`;
+ }catch(e){console.error(e);$("detectMsg").textContent="自動検出に失敗しました。画像を明るく、まっすぐ撮影して再試行してください。";}
+};
+function dataURLtoFile(data,name){const [a,b]=data.split(",");const mime=a.match(/:(.*?);/)[1];const bin=atob(b);let u=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)u[i]=bin.charCodeAt(i);return new File([u],name,{type:mime})}
+function detectLines(c){
+ // Pure JS fallback: scan grayscale for long runs of dark pixels.
+ const ctx=c.getContext("2d"), sw=1200, scale=sw/c.width, sh=Math.round(c.height*scale);
+ const t=document.createElement("canvas");t.width=sw;t.height=sh;t.getContext("2d").drawImage(c,0,0,sw,sh);
+ const im=t.getContext("2d").getImageData(0,0,sw,sh), d=im.data, rows=[];
+ for(let y=0;y<sh;y++){
+   let runs=[];let start=-1;
+   for(let x=0;x<sw;x++){
+    const i=(y*sw+x)*4,g=.299*d[i]+.587*d[i+1]+.114*d[i+2];
+    const dark=g<120;
+    if(dark&&start<0)start=x;
+    if((!dark||x===sw-1)&&start>=0){let end=x; if(end-start>120)runs.push([start,end]);start=-1;}
+   }
+   if(runs.length) rows.push({y,runs});
+ }
+ let out=[];
+ for(const r of rows) for(const [x1,x2] of r.runs){
+   if(!out.length||r.y-out[out.length-1].yy>3) out.push({x:x1/sw,y:r.y/sh,w:(x2-x1)/sw,yy:r.y});
+   else {
+    const q=out[out.length-1]; if(Math.abs(q.x-x1/sw)<.04&&Math.abs(q.w-(x2-x1)/sw)<.08){q.w=Math.max(q.w,(x2-x1)/sw);q.yy=r.y;}
+   }
+ }
+ return out.map(x=>({x:x.x,y:x.y,w:x.w}));
+}
+function mergeLines(lines){
+ const a=[];for(const l of lines){const q=a.find(z=>Math.abs(z.y-l.y)<.012&&Math.abs(z.x-l.x)<.05);if(q){q.y=(q.y+l.y)/2;q.w=Math.max(q.w,l.w)}else a.push({...l});}return a;
+}
+
+$("saveTemplate").onclick=()=>{if(!templateData){alert("テンプレートがありません");return}localStorage.setItem("ss_grader_v3",JSON.stringify(templateData));alert("保存しました。")};
+$("exportTemplate").onclick=()=>{
+ if(!templateData){alert("テンプレートがありません");return}
+ const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([JSON.stringify(templateData)],{type:"application/json"}));a.download="社会科テンプレート.json";a.click();
+};
+$("importTemplate").onchange=async e=>{const f=e.target.files[0];if(!f)return;templateData=JSON.parse(await f.text());showTemplate(templateData);};
+
+$("answerFiles").onchange=async e=>{
+ answerImages=[];$("answerPreview").innerHTML="";
+ for(const f of e.target.files){const im=await loadImage(f);answerImages.push({name:f.name,im});const img=document.createElement("img");img.src=im.src;img.style.maxWidth="180px";img.style.margin="6px";img.style.borderRadius="8px";$("answerPreview").appendChild(img)}
+};
+
+function cropForBlank(canvas,b,pad=0){
+ const x=Math.max(0,Math.floor((b.x-pad)*canvas.width));
+ const y=Math.max(0,Math.floor((b.y-pad)*canvas.height));
+ const right=Math.min(canvas.width,Math.ceil((b.x+b.w+pad)*canvas.width));
+ const bottom=Math.min(canvas.height,Math.ceil((b.y+b.h+pad)*canvas.height));
+ const w=Math.max(20,right-x),h=Math.max(20,bottom-y);
+ const c=document.createElement("canvas");c.width=w;c.height=h;
+ c.getContext("2d").drawImage(canvas,x,y,w,h,0,0,w,h);return c;
+}
+function estimateShift(templateCanvas, answerCanvas){
+  // 同じプリントを撮影した答案では、テンプレートの座標をそのまま使う。
+  // 自動シフトは空欄位置を壊すため使用しない。
+  return {dx:0,dy:0};
+}
+function shiftedCanvas(canvas,shift){
+  const out=document.createElement("canvas");out.width=canvas.width;out.height=canvas.height;
+  const x=out.getContext("2d");x.fillStyle="#fff";x.fillRect(0,0,out.width,out.height);
+  x.drawImage(canvas,shift.dx*canvas.width,shift.dy*canvas.height);return out;
+}
+function extractHandwriting(templateCrop,answerCrop){
+  const W=1000,H=300;
+  const tc=document.createElement("canvas"),ac=document.createElement("canvas");tc.width=ac.width=W;tc.height=ac.height=H;
+  const tctx=tc.getContext("2d"),actx=ac.getContext("2d");
+  tctx.fillStyle=actx.fillStyle="#fff";tctx.fillRect(0,0,W,H);actx.fillRect(0,0,W,H);
+  tctx.drawImage(templateCrop,0,0,W,H);actx.drawImage(answerCrop,0,0,W,H);
+  const td=tctx.getImageData(0,0,W,H).data,ad=actx.getImageData(0,0,W,H).data;
+  const mask=new Uint8Array(W*H); let ink=0;
+  for(let y=0;y<H;y++) for(let x=0;x<W;x++){
+    const p=(y*W+x)*4;
+    const tg=.299*td[p]+.587*td[p+1]+.114*td[p+2];
+    const ag=.299*ad[p]+.587*ad[p+1]+.114*ad[p+2];
+    const red=ad[p]-(ad[p+1]+ad[p+2])/2;
+    // テンプレートにない黒/赤の線だけ。紙の明るさ差は許容する。
+    const diff=tg-ag;
+    if((diff>12 && ag<225) || (red>15 && ag<250)) { mask[y*W+x]=1; ink++; }
+  }
+  // 下線はテンプレート側にも存在するため差分では基本的に消えるが、残った長い水平線を除去
+  const rowCount=new Uint16Array(H);
+  for(let y=0;y<H;y++){let n=0;for(let x=0;x<W;x++)n+=mask[y*W+x];rowCount[y]=n;}
+  for(let y=0;y<H;y++) if(rowCount[y]>W*0.45) for(let x=0;x<W;x++) mask[y*W+x]=0;
+  // 小さな孤立ノイズだけ除去
+  const clean=new Uint8Array(mask);
+  for(let y=1;y<H-1;y++)for(let x=1;x<W-1;x++)if(mask[y*W+x]){
+    let n=0;for(let dy=-1;dy<=1;dy++)for(let dx=-1;dx<=1;dx++)n+=mask[(y+dy)*W+x+dx];
+    if(n<2)clean[y*W+x]=0;
+  }
+  let minX=W,minY=H,maxX=-1,maxY=-1,count=0;
+  for(let y=0;y<H;y++)for(let x=0;x<W;x++)if(clean[y*W+x]){count++;minX=Math.min(minX,x);maxX=Math.max(maxX,x);minY=Math.min(minY,y);maxY=Math.max(maxY,y);}
+  if(count<18)return {canvas:blankCanvas(1200,360),inkRatio:0,bbox:null};
+  minX=Math.max(0,minX-28);maxX=Math.min(W-1,maxX+28);minY=Math.max(0,minY-28);maxY=Math.min(H-1,maxY+28);
+  const bw=maxX-minX+1,bh=maxY-minY+1,out=document.createElement("canvas");out.width=Math.max(220,bw);out.height=Math.max(90,bh);
+  const o=out.getContext("2d");o.fillStyle="#fff";o.fillRect(0,0,out.width,out.height);
+  const od=o.createImageData(bw,bh);
+  for(let y=minY;y<=maxY;y++)for(let x=minX;x<=maxX;x++){const q=((y-minY)*bw+x-minX)*4,v=clean[y*W+x]?0:255;od.data[q]=od.data[q+1]=od.data[q+2]=v;od.data[q+3]=255;}o.putImageData(od,0,0);
+  const up=document.createElement("canvas");up.width=out.width*4;up.height=out.height*4;const u=up.getContext("2d");u.fillStyle="#fff";u.fillRect(0,0,up.width,up.height);u.imageSmoothingEnabled=false;u.drawImage(out,0,0,up.width,up.height);
+  return {canvas:up,inkRatio:count/(W*H),bbox:{x:minX,y:minY,w:bw,h:bh}};
+}
+function blankCanvas(w,h){const c=document.createElement("canvas");c.width=w;c.height=h;const x=c.getContext("2d");x.fillStyle="#fff";x.fillRect(0,0,w,h);return c;}
+function makeOcrVariants(handObj,answerCrop,b){
+  const hand=handObj.canvas,variants=[];
+  variants.push({name:"手書き差分",canvas:hand,psm:"7"});
+  // 文字を太くした版
+  const thick=document.createElement("canvas");thick.width=hand.width;thick.height=hand.height;const tx=thick.getContext("2d");tx.fillStyle="#fff";tx.fillRect(0,0,thick.width,thick.height);tx.drawImage(hand,0,0);
+  const src=tx.getImageData(0,0,thick.width,thick.height),d=src.data,cp2=new Uint8ClampedArray(d);
+  for(let y=1;y<thick.height-1;y++)for(let x=1;x<thick.width-1;x++){const p=(y*thick.width+x)*4;if(d[p]<160)for(let dy=-1;dy<=1;dy++)for(let dx=-1;dx<=1;dx++){const q=((y+dy)*thick.width+x+dx)*4;cp2[q]=cp2[q+1]=cp2[q+2]=0;}}
+  src.data.set(cp2);tx.putImageData(src,0,0);variants.push({name:"手書き太線",canvas:thick,psm:"7"});
+  // 正解に含まれる文字だけを許可した原画像版。Tesseractが周囲の文字を拾うのを抑える。
+  const raw=document.createElement("canvas");raw.width=900;raw.height=260;const rx=raw.getContext("2d");rx.fillStyle="#fff";rx.fillRect(0,0,900,260);rx.drawImage(answerCrop,0,0,900,260);
+  const rd=rx.getImageData(0,0,900,260),a=rd.data;for(let i=0;i<a.length;i+=4){const g=.299*a[i]+.587*a[i+1]+.114*a[i+2],red=a[i]-(a[i+1]+a[i+2])/2,v=(g<185||red>22)?0:255;a[i]=a[i+1]=a[i+2]=v;a[i+3]=255;}rx.putImageData(rd,0,0);variants.push({name:"空欄原画像",canvas:raw,psm:"7"});
+  return variants;
+}
+function levenshtein(a,b){a=norm(a);b=norm(b);if(a===b)return 0;if(!a)return b.length;if(!b)return a.length;let prev=Array.from({length:b.length+1},(_,j)=>j);for(let i=1;i<=a.length;i++){const cur=[i];for(let j=1;j<=b.length;j++)cur[j]=Math.min(cur[j-1]+1,prev[j]+1,prev[j-1]+(a[i-1]===b[j-1]?0:1));prev=cur;}return prev[b.length];}
+function fuzzyScore(text,b){const n=norm(text),acc=accepted(b);if(!n||!acc.length)return 0;if(acc.includes(n))return 1;let best=0;for(const a of acc){const d=levenshtein(n,a),m=Math.max(n.length,a.length);best=Math.max(best,1-d/m);}return best;}
+function norm(s){return String(s||"").replace(/[ 　\t\r\n。、，,．.・「」『』（）()]/g,"").toLowerCase().replace(/[ーｰ]/g,"-");}
+function accepted(b){return [b.answer,...(b.aliases||[])].map(norm).filter(Boolean)}
+
+$("gradeBtn").onclick=async()=>{
+ if(!templateData?.blanks?.length){alert("先にテンプレートと空欄を登録してください。");return}
+ if(!answerImages.length){alert("答案写真を選択してください。");return}
+ $("results").innerHTML="";$("progressBox").innerHTML="<progress id='pg' value='0' max='1'></progress><div id='pt'>OCR準備中…</div>";
+ const worker=await Tesseract.createWorker("jpn");
+ await worker.setParameters({preserve_interword_spaces:"0"});
+ const all=[];
+ const templateCanvas=canvasOf(await loadImage(dataURLtoFile(templateData.image,"template.jpg")));
+ const total=answerImages.length*templateData.blanks.length;let done=0;
+ for(let ai=0;ai<answerImages.length;ai++){
+   const rawAnswer=canvasOf(answerImages[ai].im);
+   const shift=estimateShift(templateCanvas,rawAnswer);
+   const c=shiftedCanvas(rawAnswer,shift);
+   for(let i=0;i<templateData.blanks.length;i++){
+     $("pt").textContent=`${answerImages[ai].name}：${i+1}/${templateData.blanks.length}`;
+     const b=templateData.blanks[i];
+     const templateCrop=cropForBlank(templateCanvas,b,.004),answerCrop=cropForBlank(c,b,.004);
+     const handObj=extractHandwriting(templateCrop,answerCrop);
+     let text="",conf=0,bestName="",score=0;
+     if(handObj.inkRatio>=0.0008){
+       const candidates=[];
+       const variants=makeOcrVariants(handObj,answerCrop,b);
+       for(const v of variants){
+         for(const psm of ["7","13"]){
+           try{
+             await worker.setParameters({tessedit_pageseg_mode:psm,preserve_interword_spaces:"0"});
+             const res=await worker.recognize(v.canvas.toDataURL("image/png"));
+             const t=String(res.data.text||"").replace(/[\n\r]+/g," ").trim();
+             const cc=Number(res.data.confidence)||0;
+             if(t)candidates.push({text:t,conf:cc,name:v.name+"/PSM"+psm,score:fuzzyScore(t,b)});
+           }catch(e){console.warn(e)}
+         }
+       }
+       candidates.sort((a,z)=>{
+         // 正解への近さを最優先し、同程度ならOCR信頼度を使う
+         const sa=a.score*100+a.conf*.18,sz=z.score*100+z.conf*.18;return sz-sa;
+       });
+       const best=candidates[0];
+       if(best){text=best.text;conf=best.conf;bestName=best.name;score=best.score;}
+     }
+     const exact=accepted(b).includes(norm(text));
+     // 長い語は1文字程度のOCR誤りまで候補一致として救済。ただし短い語は厳しくする。
+     const threshold=norm(b.answer).length>=6?0.78:norm(b.answer).length>=4?0.86:1;
+     const fuzzyOK=score>=threshold && conf>=42;
+     let status=exact?(conf>=42?"○":"要確認"):(fuzzyOK?"○（候補一致）":(conf<45?"要確認":"×"));
+     all.push({file:answerImages[ai].name,b,text,conf,status,method:bestName,img:handObj.canvas.toDataURL("image/png"),score,shift});
+     done++;$("pg").value=done/total;
+   }
+ }
+ await worker.terminate();window.__gradeAll=all;renderResults(all);
+};
+function setManualStatus(idx,status){
+ const all=window.__gradeAll||[];if(!all[idx])return;all[idx].status=status;renderResults(all);
+ const el=document.querySelector(`[data-result-index="${idx}"]`);if(el)el.scrollIntoView({behavior:"smooth",block:"center"});
+}
+function editRecognition(idx){
+ const all=window.__gradeAll||[];const r=all[idx];if(!r)return;
+ const v=prompt(`問題 ${r.b.id} の認識結果を修正してください`,r.text||"");if(v===null)return;
+ r.text=v;r.conf=100;r.score=fuzzyScore(v,r.b);r.status=accepted(r.b).includes(norm(v))?"○":"×";renderResults(all);
+}
+function renderResults(all){
+ const correct=all.filter(r=>r.status==="○"||r.status==="○（候補一致）").length;
+ const review=all.filter(r=>r.status==="要確認").length;
+ const ng=all.filter(r=>r.status==="×").length;
+ const score=`<div class="card"><h3 style="margin-top:0">採点結果</h3><div style="font-size:24px;font-weight:800">${correct} / ${all.length} 問正解</div><div class="small">要確認：${review}問　／　×：${ng}問</div></div>`;
+ const rows=all.map((r,i)=>{
+   const cls=(r.status==="○"||r.status==="○（候補一致）")?"ok":r.status==="×"?"ng":"review";
+   const actions=r.status==="要確認"?`<div style="margin-top:10px;display:flex;gap:6px;flex-wrap:wrap"><button onclick="setManualStatus(${i},'○')">○ 正解</button><button class="danger" onclick="setManualStatus(${i},'×')">× 不正解</button><button class="secondary" onclick="editRecognition(${i})">認識結果を編集</button></div>`:`<button class="secondary" style="margin-top:8px" onclick="editRecognition(${i})">認識結果を編集</button>`;
+   return `<div class="result" data-result-index="${i}"><img src="${r.img}"><div><b>問題 ${esc(r.b.id)}</b>　<span class="${cls}">${r.status}</span><div>認識：<b>${esc(r.text||"（空欄）")}</b></div><div>正解：${esc(r.b.answer||"未登録")}</div><div class="small">OCR信頼度：${Math.round(r.conf)}%　／ ${esc(r.method||"")}　／ 候補一致度：${Math.round((r.score||0)*100)}%　／ ${esc(r.file)}</div>${actions}</div></div>`;
+ }).join("");
+ $("results").innerHTML=score+rows;
+}
+if(templateData)showTemplate(templateData);
+</script>
+</body>
+</html>
